@@ -1,0 +1,2357 @@
+---
+title: 'Text Analytics: Bristol Reviews'
+author: "Group 13"
+date: "5/14/2021"
+output:
+  html_document:
+    toc: yes
+    number_sections: yes
+  editor_options:
+    markdown:
+      wrap: sentence
+  word_document: 
+    toc: yes
+    fig_width: 7
+  pdf_document:
+    toc: yes
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, eval=TRUE)
+#install.packages("MASS")
+#install.packages("leaps")
+#install.packages("cld3")
+#install.packages("textcat")
+#install.packages("udpipe")
+#install.packages("widyr")
+#install.packages("igraph")
+#install.packages("ggraph")
+#install.packages("corrr")
+#install.packages("jtools")
+#install.packages("flextable")
+#install.packages("mctest")
+library(mctest)
+library(caret)
+library(corrr)
+library(rvest)
+library(tidyverse)
+library(stringr)
+library(broom)
+library(tidyr)
+library(tidytext)
+library(lubridate)
+library(cld3)
+library(qdap)
+library(textshape)
+library(tm)
+library(dplyr)
+library(magrittr)
+library(textcat)
+library(udpipe)
+library(ggmap)
+library(cluster)   
+library(topicmodels)
+library(slam)
+library(SnowballC)
+library(wordcloud)
+library(zoo)
+library(stringi)
+library(gridExtra)
+library(scales)
+library(widyr)
+library(igraph)
+library(hunspell)
+library(ggraph)
+library(Hmisc)
+library(knitr)
+summarize <- dplyr::summarize
+```
+
+# Part A: Bristol
+
+## Data import
+
+```{r}
+url_link = read_html("http://insideairbnb.com/get-the-data.html")
+all_links = url_link %>% 
+  html_nodes('a') %>% # find links
+  html_attr("href") %>% # get the url
+  str_subset("bristol") %>%
+  str_subset("2021-03-20")
+```
+
+```{r}
+# download file
+for (i in 1:length(all_links)){
+  print(i)
+  filename = paste0("file", "_", i, ".zip")
+  file = download.file(all_links[i], filename)
+}
+```
+
+```{r, warning=FALSE, message=FALSE}
+myfiles <- list.files(pattern="file.*zip")
+file = lapply(myfiles, read_csv)
+```
+
+-   file 1: Listings details
+
+```{r, results = 'hide'}
+# inspect data
+file_1 = file[[1]]
+View(file_1)
+glimpse(file_1)
+```
+
+```{r, results = 'hide'}
+file_1 %>% select_if(is.Date) %>% arrange(calendar_last_scraped) #inspect date
+file_1 %>% count(id) %>% filter(n > 1)
+```
+
+-   We can see some listings with no reviews (NA values).
+
+-   file 2: Listings information (calendar-based)
+
+```{r,results = 'hide', eval=FALSE}
+# inspect data
+file_2 = file[[2]]
+View(file_2)
+glimpse(file_2)
+```
+
+-   file 3: Review
+
+```{r,results = 'hide'}
+file_3 = file[[3]]
+View(file_3)
+glimpse(file_3)
+```
+
+-   file 4: Key metrics for listings
+
+```{r,results = 'hide', eval=FALSE}
+file_4 = file[[4]]
+View(file_4)
+glimpse(file_4)
+```
+
+-   file 5: Summary review calendar for listings
+
+```{r,results = 'hide', eval=FALSE}
+file_5 = file[[5]]
+View(file_5)
+glimpse(file_5)
+```
+
+-   file 6: Neighbourhood list for geo filter
+
+```{r,results = 'hide', eval=FALSE}
+file_6 = file[[6]]
+View(file_6)
+glimpse(file_6)
+```
+
+## EDA
+
+### Listing file
+
+-   Firstly, let's look at text columns we have (listing description, neighborhood overviews, and reviews)
+
+```{r}
+set.seed(123)
+file_1 %>% select(description) %>% sample_n(5)
+```
+
+-   From the samples above, we clearly observe that we need to remove some characters in markup language e.g., <br />, </b>, •.
+
+-   Next, let's explore common descriptions.
+
+```{r, warning=FALSE, message=FALSE}
+# explore descriptions
+file_1 %>% 
+    group_by(description) %>% 
+    summarize(n_description =n()) %>% 
+    mutate(pct=n_description /sum(n_description)) %>%
+    arrange(-n_description) %>% 
+    top_n(10,n_description)
+```
+
+-   This shows that several listings are from the same host (hotel).
+-   Next, let's check the text for neighborhood description.
+
+```{r}
+set.seed(1234)
+file_1 %>% select(neighborhood_overview) %>% sample_n(5)
+```
+
+-   Apart from the markup language, we notice NA, white space, stop words e.g., ",", ";".
+-   Let's explore more on neighborhood.
+
+```{r}
+file_1 %>% 
+    group_by(neighborhood_overview) %>% 
+    summarize(n_overview =n()) %>% 
+    mutate(pct=n_overview /sum(n_overview)) %>%
+    arrange(-n_overview) %>% 
+    top_n(3,n_overview)
+```
+
+-   We can see that some listings don't provide neighborhood details (NA values).
+
+### Review file
+
+-   Let's explore review file.
+
+```{r}
+set.seed(1234)
+file_3 %>% select(comments) %>% sample_n(5)
+```
+
+-   Apart from the markup language, we notice NA, link breaks, and stop words.
+-   Let's explore more on review by looking at top common comments.
+
+```{r, warning=FALSE, message=FALSE}
+file_3 %>% 
+    group_by(comments) %>% 
+    summarize(n_overview =n()) %>% 
+    mutate(pct=n_overview /sum(n_overview)) %>%
+    arrange(-n_overview) %>% 
+    top_n(3,n_overview) 
+```
+
+-   We observe ".", "NA", "Great ..." patterns.
+
+### Joining data
+
+-   •	Let’s join two data tables using left join for listing (file_1) and review files (file_3).
+
+```{r}
+# rename
+file_3 = file_3 %>% rename(unique_id = id)
+```
+
+```{r}
+# joining reviews with listing table using left join
+file_3 %>%
+  left_join(file_1, by = c("listing_id" = "id" )) -> df_1
+
+# clean up the memory from the other files 
+rm(file)
+rm(file_1)
+rm(file_2)
+rm(file_3)
+rm(file_4)
+rm(file_5)
+rm(file_6)
+```
+
+## Data cleaning
+
+-	We use both detect_language and textcat for higher accuracy in English language detection.
+-	The first step of data cleaning is filtering data by the date before 1 March 2020 and English language.
+-	Then, we select only potential variables that are related to price or rating scores.
+
+```{r, eval=FALSE}
+df_1$lang_desc = cld3::detect_language(df_1$description)
+df_1$lang_nb = cld3::detect_language(df_1$neighborhood_overview)
+df_1$lang_rv = cld3::detect_language(df_1$comments)
+
+df_1$lang_desc1 = textcat(df_1$description)
+df_1$lang_nb1 = textcat(df_1$neighborhood_overview)
+df_1$lang_rv1 = textcat(df_1$comments)
+```
+
+```{r, eval=FALSE}
+# explore the efficiency of detecting languages
+df_1 %>% count(lang_rv, lang_rv1) %>% filter(lang_rv == 'en') # we can still see non-english
+```
+
+```{r, eval=FALSE}
+# select relevant variables
+df_full = df_1 %>%
+              filter(date < '2020-01-03' & lang_desc == 'en' & lang_nb == 'en' & lang_rv == 'en' & lang_desc1 == 'english' & lang_nb1 == 'english' & lang_rv1 == 'english') %>%
+              select(listing_id:comments, name, description, neighborhood_overview, neighbourhood_cleansed, host_id, accommodates, host_since, host_response_rate, host_response_time, host_acceptance_rate, host_is_superhost, host_total_listings_count, host_has_profile_pic, host_identity_verified, property_type, room_type, bathrooms_text, bathrooms, beds, bedrooms, amenities, price, number_of_reviews, number_of_reviews_ltm, number_of_reviews_l30d, reviews_per_month, starts_with("review_scores_"), instant_bookable)
+```
+
+-	Let’s remove a listing with less than 5 reviews.
+  –	We start by exploring the length of reviews and then use IQR approach (Hubert and Van Der Veeken, 2008).
+-	Then, we start inspecting NULL values.
+  –	Some features have N/A as character, so we need to impute them with NULL.
+
+
+```{r, eval=FALSE}
+# let's create a column using the number of characters
+df_full$review_length_chars <- nchar(df_full$comments)
+
+# statistical summary
+summary(df_full$review_length_chars)
+
+# identifying outliers using IQR
+ggplot(df_full, aes(x=review_length_chars)) + geom_histogram() + labs(x="Review character length", y="Frequency", subtitle="Distribution of Review Character Length")
+                                                                      
+outliers1 <- boxplot(df_full$review_length_chars, ylab = "Review Length")$out
+
+# drop the rows containing outliers
+df_full <- df_full[-c(which(df_full$review_length_chars %in% outliers1)),]
+
+# plot a boxplot without outliers
+boxplot(df_full$review_length_chars, ylab = "Review Length")
+
+# plot a histogram
+hist(df_full$review_length_chars,breaks = 100,main = "Review Length(All)")
+```
+
+```{r, eval=FALSE}
+# plot a histogram
+df_full %>% group_by(listing_id) %>% 
+  summarize(total = n()) %>% ggplot(aes(x=total)) + geom_histogram() + labs(x="Total number of listings", y="Frequency", subtitle="Distribution of The Number of Listings")
+```
+
+```{r, eval=FALSE}
+# create unique id
+df_full <- df_full %>% mutate(rev_id = row_number())
+```
+
+```{r, eval=FALSE}
+# check null values
+NAcols <- which(colSums(is.na(df_full)) > 0)
+sort(colSums(sapply(df_full[NAcols], is.na)), decreasing = TRUE)
+length(NAcols)
+```
+
+-   We can drop bathroom variable since it has NULL values across observations.
+-   Let's inspect columns with NULL values.
+
+```{r, eval=FALSE}
+# check if null values are from the same ids
+na_inspect = df_full[is.na(df_full$host_since),]
+df_full %>% filter(listing_id %in% unlist(na_inspect %>% select(listing_id)))
+
+# before removing null values, replace N/A that is currently character
+for (i in 1:ncol(df_full)){
+   print(i)
+   
+   if (is.character(df_full[[i]])){
+   df_full[[i]] = str_replace(df_full[[i]], pattern = "N/A", NA_character_)
+   }
+}
+```
+
+-   We can't impute NA values due to no further information, so let's remove null values in the text columns.
+
+```{r}
+# read the data
+df_full = readRDS("df_full.rds")
+
+# check character columns
+df_full %>% select_if(is.character) 
+
+# remove unrelated variables and drop columns with null values
+df_2 = df_full %>% 
+  select(-c("bathrooms", "reviewer_name")) %>% 
+  drop_na(c("neighbourhood_cleansed", "description", "comments")) %>%
+  mutate(comments_senti = comments, description_senti = description)
+
+# check null values
+which(colSums(is.na(df_2)) > 0)
+```
+
+```{r}
+# explore the data
+glimpse(df_2)
+
+# change text columns to be lower letters
+df_2$neighbourhood_cleansed = tolower(df_2$neighbourhood_cleansed)
+df_2$description = tolower(df_2$description)
+df_2$comments = tolower(df_2$comments)
+```
+
+```{r}
+# create a function extracting only numbers
+numextract <- function(string){ 
+  str_extract(string, "\\-*\\d+\\.*\\d*")
+} 
+```
+
+-  We can’t impute NA values due to no further information, so let’s remove null values in the text columns, neighbourhood; description; comments.
+  -	Next, we start cleaning the data by lowering letters, and doing feature engineering for the new variables we presume they are related to price or rating scores.
+  - rating scores: we divide the reviews by 6 groups for further analysis based on the histogram presented below
+  –	amen_items: a number of amenities
+  –	year, month, and day
+-	This includes updating variables to be in the proper type for further analysis e.g., price with a dollar sign, response rate.
+
+
+```{r}
+# set a cut-off date
+df_2$enddate = as.Date("2020-02-29")
+
+# plot a histogram
+hist(df_2$review_scores_rating)
+
+# feature engineering
+df_2 %>% mutate(rating_group = as.numeric(cut(df_2$review_scores_rating, breaks = c(0,75,80,85,90,95,100))),
+  ops_year = as.numeric(((enddate - host_since) / 365)), 
+                   amen_items = (str_count(amenities, pattern = ",") + 1), 
+                   price_num = as.numeric(numextract(price)),
+                   response_rate = as.numeric(str_replace(host_response_rate, "%", "")), 
+                   response_time = factor(host_response_time, levels = c("wihtin an hour", "within a few hours", "within a day", "a few days or more")), 
+                   acceptance_rate = as.numeric(str_replace(host_acceptance_rate, "%", "")),
+                   host_is_superhost = as.factor(host_is_superhost),
+                   host_has_profile_pic = as.factor(host_has_profile_pic),
+                   host_identity_verified = as.factor(host_identity_verified),
+                   bathrooms = as.numeric(numextract(bathrooms_text)),
+                   instant_bookable = as.factor(instant_bookable),
+                   neighbourhood = as.factor(neighbourhood_cleansed),
+                year = strftime(date, format = "%Y"),
+                month = strftime(date, format = "%m"),
+                day = strftime(date, format = "%d")) %>%
+                  select(-c(host_since, amenities, price, host_response_rate,
+                            host_response_time,host_acceptance_rate, bathrooms_text, 
+                            neighbourhood_cleansed)) -> df
+```
+
+- However, the feature ‘price’ is currently based on price per night. Therefore, it is required for adjustment for comparability purpose across listings. Therefore, we adjust the attribute with a number of tenants resulting in price per person.
+  –	It is observed that the relationship between the adjusted price and a number of tenants is negative, which is more sensible.
+  
+  
+```{r}
+# check correlation between price and the number of tenants
+cor(df$price_num, df$accommodates,  method = "pearson", use = "complete.obs")
+
+# check the average for the number of tenants
+mean(df$accommodates, na.rm = T)
+
+# let's create a new variable using adjustment concept for price
+df = df %>% mutate(price_adj = (price_num / accommodates) * mean(df$accommodates, na.rm = T))
+
+# plot a histogram
+hist(df$price_adj)
+
+# check correlation again
+cor(df$price_adj, df$accommodates,  method = "pearson", use = "complete.obs")
+
+# visualize scatter plot to inspect the relationship
+df %>% ggplot(aes(accommodates, price_adj)) + geom_point() + geom_smooth(method="lm") + labs(subtitle="Adjusted Price per Person by The Number of Tenants", x="Number of tenants", y="Adjusted price per person")
+```
+
+-	Next, we create custom functions for cleaning purpose and apply them to both review comments and listing descriptions.
+  –	Generally, cleanse_text_withpunc is similar to cleanse_text function except that it will leave punctuation marks.
+  –	Moreover, we retrieve original text for the two variables for further analysis in other parts. Therefore, we will have four columns in total.
+
+```{r}
+# create a function for text cleaning
+cleanse_text = function(c) {
+  c = iconv(c)
+  c = gsub("[[:punct:][:blank:]]+", " ", c)
+  c = stringr::str_replace_all(c, "\r", "")
+  c = stringr::str_replace_all(c, "\n", "")
+  c = trimws(c)
+  return(c)
+}
+
+# create a function for text cleaning used for part B: sentiment analysis
+cleanse_text_withpunc = function(c) {
+  c = iconv(c)
+  c = gsub("[[:blank:]]+", " ", c)
+  c = stringr::str_replace_all(c, "\r", "")
+  c = stringr::str_replace_all(c, "\n", "")
+  c = trimws(c)
+  return(c)
+}
+```
+
+```{r}
+# cleanse texts
+df$comments = cleanse_text(df_2$comments)
+df$description = cleanse_text(df_2$description)
+
+df$comments_ori = cleanse_text_withpunc(df_2$comments_senti)
+df$description_ori = cleanse_text_withpunc(df_2$description_senti)
+```
+
+```{r, eval=FALSE}
+# inspect comments
+set.seed(1234)
+df %>% select(comments) %>% sample_n(10) %>% pull()
+
+# inspect comments with punctuation marks
+set.seed(1234)
+df %>% select(comments_ori) %>% sample_n(10) %>% pull()
+```
+
+-   Let's remove unused files.
+
+```{r, eval=FALSE}
+rm(df_1)
+rm(df_2)
+```
+
+-   Save working files in '.rds'.
+
+```{r}
+saveRDS(df, file = "df.rds")
+saveRDS(df_full, file = "df_full.rds")
+rm(df_full)
+```
+
+## Lemmatization and stemming
+
+-   Let's load the model using udpipe library.
+
+```{r, eval=FALSE}
+langmodel_download <- udpipe::udpipe_download_model("english")
+langmodel <- udpipe::udpipe_load_model(langmodel_download$file_model)
+
+```
+
+-   Let's do annotation.
+
+```{r, eval=FALSE}
+postagged <- udpipe_annotate(langmodel,
+                             df$comments,
+                             parallel.cores = 8, 
+                             trace = 5000)
+```
+
+-   We can create a data frame and explore it
+
+```{r, eval=FALSE}
+postagged <- as.data.frame(postagged)
+head(postagged)
+```
+
+-	Let’s filter and detokenize the postagged terms.
+-	After lemmatization, we merge the result back to the data frame called ‘df2’ using left join.
+
+
+```{r, eval=FALSE}
+lematized <- postagged %>% filter(upos %in% c("NOUN",
+                                              "ADJ",
+                                              "ADV")) %>% select(doc_id,lemma) %>% group_by(doc_id) %>% summarise(documents_pos_tagged = paste(lemma,collapse = " "))
+
+# create unique id
+df2 <- df %>% mutate(doc_id = paste0("doc",row_number()))
+
+# combine tables
+df2 <- df2 %>% left_join(lematized)
+
+# save the working file as .rds
+saveRDS(df2,file = "df2.rds")
+```
+
+## Tokenization
+
+-   Let's do word tokenization.
+
+```{r, eval=FALSE}
+token_df_all <- df2 %>% unnest_tokens(word,documents_pos_tagged)
+
+# check the language again and remove non-English words
+token_df_all$lan <- cld3::detect_language(token_df_all$word)
+token_df_all <- token_df_all %>% filter(lan=="en") 
+
+# check the language again and remove non-English words
+spell_check = hunspell_check(token_df_all$word)
+token_df_all = token_df_all[spell_check,]
+```
+
+-   We next back up the file.
+
+```{r, eval=FALSE}
+#saveRDS(token_df,file = "token_df.rds")
+saveRDS(token_df_all,file = "token_df_all.rds")
+```
+
+-	Let’s inspect text length.
+
+```{r}
+# read data
+token_df_all = readRDS("token_df_all.rds")
+
+# calculate the token length 
+token_df_all$token_length <- nchar(token_df_all$word)
+
+# let's have a look on the distribution 
+token_df_all %>% group_by(token_length) %>% summarise(total =n()) %>% ggplot(aes(x=token_length, y=total)) + geom_col() + labs(x="Token length", y="Frequency", subtitle="Distribution of Token Length")
+
+# let's have a look at the distribution of tokens again 
+token_df_all %>% group_by(token_length) %>% 
+  summarise(total =n()) %>% 
+  arrange(desc(token_length))
+```
+
+-We can remove some texts if the length is too long.
+  –	From the plot below, the length is right-skewed and it is observed that there are only few words that have more length than 14.
+  –	However, this is possibly useful for the analysis. Hence, we decide to keep them.
+
+```{r}
+token_df_all %>% count(word, sort=T)
+
+# remove null values in words
+token_df_all = token_df_all[!is.na(token_df_all$word),]
+```
+
+-	Based on the frequency, we observe that there are words, mainly nouns, which will not benefit in text analysis. Therefore, we will need to remove these words. 
+- Therefore, let's remove stop words.
+
+```{r, warning=FALSE, message=FALSE}
+# load stop words
+data("stop_words")
+token_df2 = token_df_all %>% anti_join(stop_words, by = "word")
+
+# retrieve host name from available data
+file = lapply(myfiles, read_csv)
+hostname = file[[4]]
+
+hostname<-hostname %>%
+  filter(str_count(host_name,boundary("word"))==1 ) %>%
+  unique() %>%
+  as_tibble()
+
+hostname_vector = as_tibble(unique(hostname$host_name))
+
+# rename a column name
+colnames(hostname_vector) = "word"
+```
+
+-   Let’s add custom stop words, which are mainly about neighbourhoods or person name.
+
+```{r}
+# generate new stop words
+mystopwords <- tibble(word =c("bristol", "city", "stay", "airbnb", "clifton", "windmill", "easton", "redland", "southmead", "hotwells", "harbourside","ashley", "henbury", "george", "southville","eastville", "bishopston", "knowle", "lockleaze", "filwood", "cotham", "henleaze", "bishopsworth","sarah"))
+
+# combine stop words
+mystopwords<-mystopwords %>% bind_rows(hostname_vector)
+mystopwords$word<-tolower(mystopwords$word)
+
+# combine data sets
+token_df2 = token_df2 %>% anti_join(mystopwords, by = "word")
+
+# explore top words across corpus
+token_df2 %>% group_by(word) %>% 
+  summarise(total =n()) %>% 
+  arrange(desc(total)) %>% 
+  top_n(10) 
+```
+
+```{r}
+# save file
+saveRDS(token_df2,file = "token_df2.rds")
+```
+
+## TF-IDF
+
+-   Let's calculate TF-IDF for a whole corpus.
+
+```{r}
+listing_words = token_df2 %>% count(listing_id, word, sort=T)
+
+total_words <- listing_words %>% 
+  group_by(listing_id) %>% 
+  summarize(total = sum(n))
+
+listing_words <- listing_words %>% 
+  left_join(total_words)
+```
+
+```{r bindtfidf}
+listing_tf_idf <- listing_words %>% bind_tf_idf(word,listing_id,n) %>% select(-total) 
+```
+
+-   Next, we will inspect the data with TF-IDF calculation.
+-   We can see that there is high frequency of words where tf-idf is less than 0.1 (low) across listings.
+
+```{r inspecttfidf}
+# plot a histogram
+hist(listing_tf_idf$tf_idf,breaks = 80,main="TF-IDF plot", xlim = c(0,1))
+```
+
+-   Let's zoom in the data where TF-IDF \< 0.3
+
+```{r}
+listing_tf_idf <- listing_tf_idf %>% 
+  filter(tf_idf<=0.3)
+
+# plot a histogram
+hist(listing_tf_idf$tf_idf,breaks = 80,main="TF-IDF plot", xlim = c(0,0.2))
+```
+
+-   We can see that common words are found the most where tf-idf is equal to 0.01-0.02.
+
+```{r}
+listing_tf_idf_2 <- listing_tf_idf %>% 
+  filter(tf_idf<=0.2)
+
+# statistical summary
+summary(listing_tf_idf_2$tf_idf)
+
+# let's explore the top 10 words with the highest tf-idf
+listing_tf_idf_2 %>% 
+  group_by(word) %>% 
+  arrange(desc(tf_idf)) %>% 
+  top_n(10)
+```
+
+- From the top highest tf-idf words, they provide the sign of positive words e.g., greatly, lively, efficiently, pleasantly. This is possibly because mose of the reviews have high rating scores.
+
+```{r}
+# let's explore the top 10 words with the lowest tf-idf
+listing_tf_idf_2 %>% 
+  group_by(word) %>% 
+  arrange(tf_idf) %>% 
+  top_n(10) 
+```
+
+- Rare words i.e., low frequent words, don't provide much insights but we can observe negative words e.g., problematic, ridiculously.
+
+## Analysis
+
+### Dominant words per category
+
+-   What are the dominant words per aggregation category (neighborhood, access to public transport etc.)?
+
+#### Neighborhood
+
+- Let's explore word frequency by neighbourhood.
+
+```{r, warning = FALSE, message = FALSE}
+neighbour_words <- token_df2 %>%
+count(neighbourhood, word, sort = TRUE)
+
+# word count for each neighbourhood
+total_neighbour_words <- neighbour_words %>%
+group_by(neighbourhood) %>%
+summarize(total = sum(n))
+
+# left join
+neighbour_words <- neighbour_words %>%
+left_join(total_neighbour_words)
+```
+
+- From the charts below, we can see that words with low frequency are the most common across neighbourhoods.
+
+```{r, warning = FALSE, message = FALSE}
+# visualization of the frequency
+neighbour_words %>%
+  mutate(tf = n/total) %>%
+  ggplot(aes(x=tf,fill=neighbourhood)) +
+  geom_histogram(show.legend = FALSE)+
+  facet_wrap(~neighbourhood,ncol=10,scales = "free_y")
+```
+
+-   Let's apply Zipf's law
+-   We can observe that words in each neighbourhood moderately follow Zipf's law.
+-   Notice that the significant deviation among neighbourhoods starts with words in the high rank or with low tf.
+
+```{r, warning = FALSE, message = FALSE}
+neighbour_words %>%
+  group_by(neighbourhood) %>%
+  mutate(rank = row_number(),
+  tf = n/total) %>%
+  ungroup() -> zipf_data
+
+# plot using Zipf's law
+zipf_data %>%
+  ggplot(aes(rank, tf, color = neighbourhood)) +
+  geom_line(size = 1.1, alpha = 0.8, show.legend = TRUE) +
+  scale_x_log10() +
+  scale_y_log10()
+```
+
+-   TF-IDF by neighborhood
+
+```{r, warning = FALSE, message = FALSE}
+neighbour_tf_idf <- neighbour_words %>%
+  bind_tf_idf(word,neighbourhood,n) %>%
+  select(-total)
+```
+
+-   Filter data
+  - from the above, we only need to filter words where there are high frequency of words i.e., common words.
+  
+```{r, warning = FALSE, message = FALSE}
+neighbour_tf_idf <- neighbour_tf_idf %>%
+filter(tf_idf>0.002) 
+
+neighbour_tf_idf %>%
+  ggplot(aes(tf_idf)) +
+  geom_histogram() +
+  xlim(0,0.02)
+```
+
+-   Visualization
+
+```{r, warning = FALSE, message = FALSE}
+# create own function to wrap texts
+swr = function(string, nwrap=20) {
+  paste(strwrap(string, width=nwrap), collapse="\n")
+}
+swr = Vectorize(swr)
+```
+
+```{r, warning = FALSE, message = FALSE}
+neighbour_tf_idf %>%
+  group_by(neighbourhood) %>%
+  slice_max(tf_idf,n=5,with_ties = F) %>%
+  ungroup() %>%
+  mutate(neighbourhood = swr(neighbourhood), row = row_number(), word2 = fct_reorder(word, tf_idf)) -> n
+
+n %>%
+  ggplot(aes(tf_idf, word2, fill = neighbourhood)) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~neighbourhood, ncol = 5, scales = "free") +
+  labs(x = "tf-idf", y = "Top 5 Words")
+```
+
+- From the plot above, overall the top words with the highest tf-idf for each neighbourhood are noun while some presents adjective or adverb such as solicitous in Stoke Bishop, familiarly in St. George Central.
+- Considering top 3 neighborhoods with the highest number of reviews, which are Ashley, Central, and Clifton; we observe that common words are view and central while the distinctive word for each neighbourhood is lively, middle, and candy, respectively.
+
+#### Month
+
+```{r, warning = FALSE, message = FALSE}
+month_words <- token_df2 %>%
+count(month, word, sort = TRUE)
+
+# word count for each month
+total_month_words <- month_words %>%
+group_by(month) %>%
+summarize(total = sum(n))
+
+# left join
+month_words <- month_words %>%
+left_join(total_month_words)
+
+# visualization of the frequency
+month_words %>%
+mutate(tf = n/total) %>%
+ggplot(aes(x=tf,fill=month))+
+geom_histogram(show.legend = FALSE)+
+xlim(0,0.0009)+
+facet_wrap(~month,ncol=5,scales = "free_y")
+```
+
+-  From the above plot, we have the similar pattern of words with the same tf values across months - from July to October.
+
+-   Let's apply Zipf's law.
+
+```{r, warning = FALSE, message = FALSE}
+month_words %>%
+  group_by(month) %>%
+  mutate(rank = row_number(),
+  tf = n/total) %>%
+  ungroup() -> zipf_data
+
+# plot
+zipf_data %>%
+  ggplot(aes(rank, tf, color = month)) +
+  geom_line(size = 1.1, alpha = 0.8, show.legend = TRUE) +
+  scale_x_log10() +
+  scale_y_log10()
+```
+
+-   From Zipf's plot, we can see that words that are distinctive from each month are at the rank higher than 10. Hence, we will filter data to remove common or popular words.
+
+-   TF-IDF by month
+
+```{r, warning = FALSE, message = FALSE}
+month_tf_idf <- month_words %>%
+bind_tf_idf(word,month,n) %>%
+select(-total)
+
+# explore the distribution
+month_tf_idf %>%
+filter(tf_idf>0) %>%
+ggplot(aes(tf_idf))+geom_histogram(bins = 50)
+```
+
+-   Filter data
+
+```{r, warning = FALSE, message = FALSE}
+month_tf_idf <- month_tf_idf %>%
+filter(tf_idf>0.0003)
+
+month_tf_idf %>%
+filter(tf_idf>0) %>%
+ggplot(aes(tf_idf))+geom_histogram()
+```
+
+-   Visualization
+
+```{r, warning = FALSE, message = FALSE}
+#rank the words and calculate the dominant words
+month_tf_idf %>% 
+  group_by(month)%>%
+  arrange(desc(tf_idf)) %>% 
+  slice_max(tf_idf,n=7,with_ties = F) %>%
+  ungroup() %>%
+  ggplot(aes(tf_idf, reorder(word, tf_idf), fill = month)) +
+    geom_col(show.legend = FALSE) +
+    facet_wrap(~month, ncol = 6, scales = "free", labeller =labeller(month = c("01" = "Jan", "02" = "Feb", "03" = "Mar", "04" = "Apr", "05" = "May", "06" = "Jun", "07" = "Jul", "08" = "Aug", "09" = "Sep", "10" = "Oct", "11" = "Nov", "12" = "Dec"))) +
+    labs(x = "tf-idf", y = "Top 7 Words")
+```
+
+- From the plot above, overall we rarely identify meaningful words from the month perspective. However, we can see some seasonal words in Sep-Oct e.g., rugby.
+
+#### Price range
+
+```{r, warning = FALSE, message = FALSE}
+# explore the distribution of listing price
+
+token_df2 %>% ggplot(aes(x=price_num)) + geom_histogram(bins = 100) + xlim(c(0,400))
+
+summary(token_df2$price_num)
+
+# let's equally allocate the data into 7 groups
+token_df2$price_group <- as.numeric(cut(token_df2$price_num, breaks = c(0,30,45,60,75,90,150,800)))
+
+token_df2 %>% group_by(price_group) %>% summarize(mean = mean(price_num), count = n())
+
+# tokenize by price_group
+price_group_words <- token_df2 %>%
+count(price_group, word, sort = TRUE)
+
+# word count for each price_group
+total_price_group_words <- price_group_words %>%
+group_by(price_group) %>% 
+summarize(total = sum(n))
+
+# left join
+price_group_words <- price_group_words %>%
+left_join(total_price_group_words)
+
+# visualization of the frequency
+price_group_words %>%
+mutate(tf = n/total, price_group2 = swr(price_group)) %>%
+ggplot(aes(x=tf,fill=price_group2))+
+geom_histogram(show.legend = FALSE)+
+facet_wrap(~price_group2,ncol=4,scales = "free_y", labeller =labeller(price_group2 = c("1" = "0-30 Dollars", "2" = "31-45 Dollars", "3" = "46-60 Dollars", "4" = "61-75 Dollars", "5" = "76-90 Dollars", "6" = "91-150 Dollars", "7" = "More than 150 Dollars")))
+```
+
+-  From the above, words follow similar pattern where they have the same value of tf across price range.
+
+-   Let's apply Zipf's law.
+
+```{r, warning = FALSE, message = FALSE}
+price_group_words %>%
+  group_by(factor(price_group)) %>%
+  mutate(rank = row_number(),tf = n/total) %>%
+  ungroup() -> zipf_data
+
+# plot
+zipf_data %>%
+  ggplot(aes(rank, tf, color = factor(price_group))) +
+  geom_line(size = 1.1, alpha = 0.8, show.legend = TRUE) +
+  scale_x_log10() +
+  scale_y_log10()
+```
+
+-   We see small deviation of words at the low rank and higher deviation at the high rank where rank is higher than 110 approximately.
+
+-   TF-IDF by price range
+
+```{r, warning = FALSE, message = FALSE}
+price_group_tf_idf <- price_group_words %>%
+bind_tf_idf(word,price_group,n) %>%
+select(-total)
+
+# filter data
+price_group_tf_idf %>%
+filter(tf_idf>0) %>%
+ggplot(aes(tf_idf))+geom_histogram()
+```
+
+-   Filter data
+  - From the above, it is likely that words deviate across price groups. Hence, we will not remove data.
+
+```{r, warning = FALSE, message = FALSE}
+price_group_tf_idf <-price_group_tf_idf %>% filter(tf_idf>0)
+
+# plot a histogram
+price_group_tf_idf %>%
+ggplot(aes(tf_idf))+geom_histogram()
+```
+
+-   Visualization
+
+```{r, warning = FALSE, message = FALSE}
+# set the axis value
+options(scipen=10000)
+
+# plot
+price_group_tf_idf %>% 
+  group_by(price_group) %>%
+  arrange(desc(tf_idf)) %>%
+  slice_max(tf_idf,n=7,with_ties = F) %>%
+  ungroup() %>%
+  mutate(price_group2 = swr(price_group)) %>%
+  ggplot(aes(tf_idf, reorder(word, tf_idf), fill = price_group2)) +
+    geom_col(show.legend = FALSE) +
+    facet_wrap(~price_group2, ncol = 4, scales = "free", labeller =labeller(price_group2 = c("1" = "0-30 Dollars", "2" = "31-45 Dollars", "3" = "46-60 Dollars", "4" = "61-75 Dollars", "5" = "76-90 Dollars", "6" = "91-150 Dollars", "7" = "More than 150 Dollars"))) +
+    labs(x = "tf-idf", y = "Top 7 Words") + theme(strip.background = element_blank(), strip.placement = "outside")
+```
+
+- From the plot, we see that top words with high tf-idf are noun across price groups.
+- We can also notice that among the listing price higher than $150, useful words are about food e.g., pickle, cocktail, meat.
+
+#### Review rating
+
+```{r, warning = FALSE, message = FALSE}
+# explore the distribution of review rating score
+hist(token_df2$review_scores_rating)
+
+# grouping the data into 6 groups
+token_df2$rating_group <- as.numeric(cut(token_df2$review_scores_rating, breaks = c(0,75,80,85,90,95,100)))
+
+token_df2 = token_df2 %>% filter(!is.na(rating_group))
+
+rating_group_words <- token_df2 %>%
+count(rating_group, word, sort = TRUE)
+
+# word count for each rating_group
+total_rating_group_words <- rating_group_words %>%
+group_by(rating_group) %>% 
+dplyr::summarize(total = sum(n))
+
+# left join
+rating_group_words <- rating_group_words %>%
+left_join(total_rating_group_words)
+
+# visualization of the frequency
+rating_group_words %>%
+mutate(tf = n/total) %>%
+ggplot(aes(x=tf,fill=rating_group))+
+geom_histogram(show.legend = FALSE)+
+facet_wrap(~rating_group,ncol=3,scales = "free_y")
+```
+
+-   From the plot above, only those with scores higher than 85, has high frequency of unique/rare words across listings.
+
+-   Let's apply Zipf's law
+
+```{r, warning = FALSE, message = FALSE}
+rating_group_words %>%
+  group_by(rating_group) %>%
+  mutate(rank = row_number(),tf = n/total, rating_group = factor(rating_group)) %>%
+  ungroup() -> zipf_data
+
+# plot
+zipf_data %>%
+  ggplot(aes(rank, tf, color = rating_group)) +
+  geom_line(size = 1.1, alpha = 0.8, show.legend = TRUE) +
+  scale_color_manual(name="Rating Group",
+                       labels=c("0-75", "76-80", "81-85", "86-90","91-95","96-100"),
+                       values=c("red","green","blue", "black","purple","orange")) +
+  scale_x_log10() +
+  scale_y_log10() +
+  xlab("Rank") +
+  ylab("tf") 
+```
+
+-   From the plot above, the deviation of words starts at the low rank. 
+
+-   TF-IDF by rating groups
+
+```{r, warning = FALSE, message = FALSE}
+rating_group_tf_idf <- rating_group_words %>%
+bind_tf_idf(word,rating_group,n) %>%
+select(-total) %>%
+  arrange(desc(tf_idf))
+
+# remove outliers
+rating_group_tf_idf %>%
+filter(tf_idf>0) %>%
+ggplot(aes(tf_idf))+geom_histogram() + xlim(c(0,0.05))
+```
+
+-   Filter data
+  - Let's try filter data where tf-idf is higher than 0.02 i.e., common words removal.
+
+```{r, warning = FALSE, message = FALSE}
+rating_group_tf_idf <-rating_group_tf_idf %>%
+  filter(tf_idf>0.002) 
+```
+
+-   Visualization
+
+```{r, warning = FALSE, message = FALSE}
+rating_group_tf_idf %>% 
+  group_by(rating_group)%>%
+  arrange(desc(tf_idf)) %>%
+  slice_max(tf_idf,n=7,with_ties = F) %>%
+  ungroup() %>%
+  mutate(rating_group2 = swr(rating_group)) %>%
+  ggplot(aes(tf_idf, word, fill = rating_group2)) +
+    geom_col(show.legend = FALSE) +
+    facet_wrap(~rating_group2, ncol = 3, scales = "free", labeller = labeller(rating_group2 = c("1" = "Score 0-75","2" = "Score 76-80", "3"="Score 81-85", "4"="Score 86-90", "5" = "Score 91-95", "6" = "Score 96-100"))) +
+    labs(x = "tf-idf", y = "Top 7 Words") + theme(strip.background = element_blank(), strip.placement = "outside") 
+```
+
+- From the plot above, we clearly see that those with rating score 0-75 represents unsatisfied which is potentially from products or services.
+- Bed is the common word across rating groups except from the first group which has the lowest score.
+
+#### Property Type
+
+```{r, warning = FALSE, message = FALSE}
+roomtype_words <- token_df2 %>%
+count(room_type, word, sort = TRUE)
+
+# word count for each month
+total_roomtype_words <- roomtype_words %>%
+group_by(room_type) %>%
+summarize(total = sum(n))
+
+# left join
+roomtype_words <- roomtype_words %>%
+left_join(total_roomtype_words)
+
+# visualization of the frequency
+roomtype_words %>%
+mutate(tf = n/total) %>%
+ggplot(aes(x=tf,fill=room_type))+
+geom_histogram(show.legend = FALSE)+
+xlim(0,0.2)+
+facet_wrap(~room_type,ncol=2,scales = "free_y")
+```
+
+-   From the above, we see that words have different values of tf across room types. 
+-   Let's apply Zipf's law.
+
+```{r, warning = FALSE, message = FALSE}
+roomtype_words %>%
+  group_by(room_type) %>%
+  mutate(rank = row_number(),tf = n/total) %>%
+  ungroup() -> zipf_data
+
+# plot
+zipf_data %>%
+  ggplot(aes(rank, tf, color = room_type)) +
+  geom_line(size = 1.1, alpha = 0.8, show.legend = TRUE) +
+  scale_x_log10() +
+  scale_y_log10()
+```
+
+- From the above, shared room contains fewer number of words. 
+- In addition, we observe deviation of words of hotel room type starting at words with the rank 80-100 while the deviation between entire home and private room types starts at the rank higher than 140.
+
+-   TF-IDF by room types
+
+```{r, warning = FALSE, message = FALSE}
+roomtype_tf_idf <- roomtype_words %>%
+bind_tf_idf(word,room_type,n) %>%
+select(-total)
+
+# explore the distribution
+roomtype_tf_idf %>%
+filter(tf_idf>0) %>%
+ggplot(aes(tf_idf))+geom_histogram()
+```
+
+- From the plot above, we see that common words have high frequency. Hence, we need to remove this.
+
+-   Filter data
+
+```{r, warning = FALSE, message = FALSE}
+roomtype_tf_idf <-roomtype_tf_idf %>%
+filter(tf_idf>0.001)
+
+roomtype_tf_idf %>%
+filter(tf_idf>0) %>%
+ggplot(aes(tf_idf))+geom_histogram()
+```
+
+-   Visualization
+
+```{r, warning = FALSE, message = FALSE}
+roomtype_tf_idf %>% 
+  group_by(room_type)%>%
+  arrange(desc(tf_idf)) %>% 
+  slice_max(tf_idf,n=7,with_ties = F) %>%
+  ungroup() %>%
+  ggplot(aes(tf_idf, reorder(word, tf_idf), fill = room_type)) +
+    geom_col(show.legend = FALSE) +
+    facet_wrap(~room_type, ncol = 6, scales = "free") +
+    labs(x = "tf-idf", y = "Top 7 Words")
+```
+
+-   According to the plot, the common word across room types (except shared room) is 'space', 'minute', 'view', and 'town', which possibly indicates location and room types. In addition, 'central' is common in entire home and hotel room types.
+
+### Word combinations
+
+-   What are the most common word combinations used to describe a property listing?
+
+#### Unigrams
+
+-   Let's tokenizing the data into unigrams
+
+```{r tokenizing data, echo=TRUE, message=FALSE, warning=FALSE, paged.print=TRUE}
+# read data
+df2 = readRDS("df2.rds")
+
+listings.description <- df2 %>% 
+  distinct(listing_id,description,neighbourhood,review_scores_rating,price_num,property_type, host_id,host_is_superhost, rating_group)
+
+# preparing the data frame on which analysis will be done
+listings.description %>% unnest_tokens(word,description) -> listings.description.working
+```
+
+-   To remove stop words
+-   [how we decide custom stop words?]
+
+```{r removing stop words, echo=TRUE, message=FALSE, warning=FALSE, paged.print=TRUE}
+# removing the stop words
+data("stop_words")
+# adding custom stop words in a csv and reading from that file
+custom_stopwords <- read.csv("customStopWord.csv", header = TRUE)
+# removing the stop words from the working dataframe
+  listings.description.working <- listings.description.working %>% 
+  anti_join(stop_words) %>% anti_join(custom_stopwords) %>% 
+  # keeping only the words and removing everything extra
+  mutate(word = str_extract(word, "[a-z']+")) %>%  
+    filter(is.na(word)==FALSE)
+```
+
+-   Let's do spell checking and remove non-English words
+
+```{r}
+# check the language and remove non-English words
+listings.description.working$lan <- cld3::detect_language(listings.description.working$word)
+
+listings.description.working <- listings.description.working %>% filter(lan=="en") 
+
+# check the language again using different library to improve accuracy
+spell_check = hunspell_check(listings.description.working$word)
+listings.description.working = listings.description.working[spell_check,]
+```
+
+-   Let's visualize the top 20 words used in descriptions
+
+```{r visualising data, echo=TRUE, message=FALSE, warning=FALSE, paged.print=TRUE}
+  listings.description.working %>% 
+    count(word) %>% 
+    mutate(word=reorder(word,n)) %>% 
+    slice_max(n,n=20) %>% 
+    ggplot(aes(word,n)) + 
+    geom_bar(stat = "identity") +
+    xlab(NULL) +
+    coord_flip()
+```
+
+-   From the above, we could see top 3 of frequent words are about space, bed, equipped. This potentially indicates about room characteristics that guests are looking for where hosts use these words for listing descriptions.
+
+-   Let's see the top 10 words in description w.r.t. review rating score
+
+```{r plotting most common words as per rating, echo=TRUE, message=FALSE, warning=FALSE, paged.print=TRUE}
+# most common words used when rating group = 1
+rating4.maxwords <- listings.description.working %>% 
+  filter(rating_group==1) %>% 
+  count(word) %>% 
+  mutate(word=reorder(word,n)) %>% 
+  slice_max(n,n=10) %>% 
+  ggplot(aes(word,n)) + 
+  geom_bar(stat = "identity") +
+  xlab(NULL) +
+  labs(title = "Review Score: 0-75")+
+  coord_flip()
+
+# most common words used when rating group = 2
+rating6.maxwords <- listings.description.working %>% 
+  filter(rating_group==2) %>% 
+  count(word) %>% 
+  mutate(word=reorder(word,n)) %>% 
+  slice_max(n,n=10) %>% 
+  ggplot(aes(word,n)) + 
+  geom_bar(stat = "identity") +
+  xlab(NULL) +
+  labs(title = "Review Score: 76-80")+
+  coord_flip()
+
+# most common words used when rating group = 3
+rating7.maxwords <- listings.description.working %>% 
+  filter(rating_group==3) %>% 
+  count(word) %>% 
+  mutate(word=reorder(word,n)) %>% 
+  slice_max(n,n=10) %>% 
+  ggplot(aes(word,n)) + 
+  geom_bar(stat = "identity") +
+  xlab(NULL) +
+  labs(title = "Review Score: 81-85")+
+  coord_flip()
+
+# most common words used when rating group = 4
+rating8.maxwords <- listings.description.working %>% 
+  filter(rating_group==4) %>% 
+  count(word) %>% 
+  mutate(word=reorder(word,n)) %>% 
+  slice_max(n,n=10) %>% 
+  ggplot(aes(word,n)) + 
+  geom_bar(stat = "identity") +
+  xlab(NULL) +
+  labs(title = "Review Score: 86-90")+
+  coord_flip()
+
+# most common words used when rating group = 5
+rating9.maxwords <- listings.description.working %>% 
+  filter(rating_group==5) %>% 
+  count(word) %>% 
+  mutate(word=reorder(word,n)) %>% 
+  slice_max(n,n=10) %>% 
+  ggplot(aes(word,n)) + 
+  geom_bar(stat = "identity") +
+  xlab(NULL) +
+  labs(title = "Review Score: 91-95")+
+  coord_flip()
+
+# most common words used when rating group = 6
+rating10.maxwords <- listings.description.working %>% 
+  filter(rating_group==6) %>% 
+  count(word) %>% 
+  mutate(word=reorder(word,n)) %>% 
+  slice_max(n,n=10) %>% 
+  ggplot(aes(word,n)) + 
+  geom_bar(stat = "identity") +
+  xlab(NULL) +
+  labs(title = "Review Score: 96-100")+
+  coord_flip()
+
+maxwords.plots = arrangeGrob(rating4.maxwords,rating6.maxwords, rating7.maxwords, rating8.maxwords, rating9.maxwords, rating10.maxwords) 
+grid.arrange(maxwords.plots,  ncol = 2, widths = c(3/4,1/4))
+
+```
+
+-   From the above, we can see that top 3 frequent words are still about space, bed, and equipped across rating score groups.
+-   However, we notice that 'business' is represented in the rating groups with the scores higher than 85 while in the last group, 'size' is one of the words that deviate this group from others.
+-   Now, let's check the top 10 words in descriptions w.r.t. neighborhood.
+
+```{r}
+# create a vector filled with random normal values
+u1 <- lapply(listings.description.working %>% distinct(neighbourhood),as.character)
+u2 <- lapply(listings.description.working %>% distinct(neighbourhood),as.character)
+
+u7 <- ""
+rating.neighbourhood <- 0
+
+for(i in 1:length(u1[[1]])) {
+ u1[[1]][i] <- str_replace_all(u1[[1]][i]," ","")
+u1[[1]][i] <- str_replace_all(u1[[1]][i],"&","")
+u1[[1]][i] <- str_replace_all(u1[[1]][i],"-","")
+
+assign( paste0("rating.neighbourhood.",u1[[1]][i]) , listings.description.working %>%
+  filter(neighbourhood==u2[[1]][i]) %>%
+  count(word) %>%
+  mutate(word=reorder(word,n)) %>%
+  slice_max(n,n=10) %>%
+  ggplot(aes(word,n)) +
+  geom_bar(stat = "identity") +
+  xlab(NULL) +
+  labs(title = paste0("Neighbourhood = ", u2[[1]][i]))+
+  coord_flip())
+  u7 <- paste(u7,paste0("rating.neighbourhood.",u1[[1]][i]),sep=",") 
+}
+
+# let's see the visualization
+rating.neighbourhood.windmillhill
+rating.neighbourhood.clifton
+rating.neighbourhood.bedminster
+rating.neighbourhood.easton
+rating.neighbourhood.ashley
+rating.neighbourhood.brislingtonwest
+rating.neighbourhood.redland
+rating.neighbourhood.knowle
+rating.neighbourhood.lawrencehill
+rating.neighbourhood.stokebishop
+rating.neighbourhood.hotwellsharbourside
+rating.neighbourhood.henburybrentry
+rating.neighbourhood.cotham
+rating.neighbourhood.southmead
+rating.neighbourhood.cliftondown
+rating.neighbourhood.southville
+rating.neighbourhood.avonmouthlawrenceweston
+rating.neighbourhood.eastville
+rating.neighbourhood.brislingtoneast
+rating.neighbourhood.central
+rating.neighbourhood.bishopstonashleydown
+rating.neighbourhood.stgeorgewest
+rating.neighbourhood.horfield
+rating.neighbourhood.westburyontrymhenleaze
+rating.neighbourhood.lockleaze
+rating.neighbourhood.hillfields
+rating.neighbourhood.bishopsworth
+rating.neighbourhood.fromevale
+rating.neighbourhood.stgeorgecentral
+rating.neighbourhood.hengrovewhitchurchpark
+rating.neighbourhood.filwood
+rating.neighbourhood.hartcliffewithywood
+rating.neighbourhood.stgeorgetroopershill
+```
+
+-   Considering top 3 neighbourhoods with the most reviews, which are Ashley, Central, and Clifton, the common words are 'space', 'bed', and 'stay'.
+-   'relax' is the word that deviates Clifton from others while it is unclear to observe such word in Ashley and Central.
+
+
+-   Let's explore the top words used by hosts with multiple listings.
+
+```{r}
+# inspect the number of listings in 'total' column
+listings.description %>% group_by(host_id) %>% mutate(total = n()) %>% summary(.)
+
+# list all the hosts with more than 10 listings
+listings.description %>% group_by(host_id) %>% count() %>% arrange(desc(n)) %>% filter(n>10) %>% select(host_id)
+```
+
+-   From the above, we can use median (median = 1) as the threshold to check whether there is a difference in top words or not since the data above illustrates high skewness.
+
+```{r}
+# hosts with multiple listings
+host.greaterthan1listing <- listings.description %>% group_by(host_id) %>% count() %>% arrange(desc(n)) %>% filter(n>1)
+
+listings.description.working %>% 
+  filter(host_id %in% host.greaterthan1listing$host_id) %>% 
+    count(word) %>% 
+    mutate(word=reorder(word,n)) %>% 
+    slice_max(n,n=20) %>% 
+    ggplot(aes(word,n)) + 
+    geom_bar(stat = "identity") +
+    xlab(NULL) +
+  labs(title = "Hosts with multiple listings") +
+    coord_flip()
+```
+
+-   Let's visualize the data
+
+```{r}
+# hosts with only 1 listing
+host.with1listing <- listings.description %>% group_by(host_id) %>% count() %>% arrange(desc(n)) %>% filter(n==1)
+
+listings.description.working %>% filter(host_id %in% host.with1listing$host_id) %>% 
+    count(word) %>% 
+    mutate(word=reorder(word,n)) %>% 
+    slice_max(n,n=20) %>% 
+    ggplot(aes(word,n)) + 
+    geom_bar(stat = "identity") +
+    xlab(NULL) +
+    labs(title = "Hosts with 1 listing") +
+    coord_flip()
+```
+
+-   Let's compare them
+
+```{r}
+grid.arrange(listings.description.working %>% filter(host_id %in% host.with1listing$host_id) %>% 
+    count(word) %>% 
+    mutate(word=reorder(word,n)) %>% 
+    slice_max(n,n=20) %>% 
+    ggplot(aes(word,n)) + 
+    geom_bar(stat = "identity") +
+    xlab(NULL) +
+    labs(title = "Hosts with 1 listing") +
+    coord_flip(), listings.description.working %>% 
+  filter(host_id %in% host.greaterthan1listing$host_id) %>% 
+    count(word) %>% 
+    mutate(word=reorder(word,n)) %>% 
+    slice_max(n,n=20) %>% 
+    ggplot(aes(word,n)) + 
+    geom_bar(stat = "identity") +
+    xlab(NULL) +
+  labs(title = "Hosts with multiple listings") +
+    coord_flip(), nrow = 1)
+```
+
+-   We see that top common words are 'space', 'bed, 'stay', 'note', and 'equipped'. 
+-   Nevertheless, host with multiple listings present distinctive words such as 'relax', 'size', and 'families', which provides more sense of recreation.
+-   Now, let's evaluate the length of description vs. review score.
+
+```{r}
+listings.description %>% 
+  mutate(length.description = log(nchar(description))) -> ld 
+
+ld %>%
+  ggplot(aes(x=length.description)) + 
+  geom_histogram(bins = 50)
+
+# identifying outliers using IQR
+outliers2 <- boxplot(ld$length.description, ylab = "Description Length")$out
+
+# drop the rows containing outliers
+ld <- ld[!ld$length.description %in% outliers2,]
+
+# plot a boxplot without outliers
+boxplot(ld$length.description, ylab = "Description Length")
+
+# plot a scatter plot
+ld %>% ggplot(aes(x=length.description,y=review_scores_rating))+geom_point()+geom_smooth() + labs(x = "Description length", y="Rating scores", subtitle = "Rating Scores and Description Lenght Relationship")
+```
+
+-   Although we removed outliers and applied log transformation with the description length, there is no clear relationship between the review scores and the length.
+
+-   Let's explore distinctive words in terms of frequency across rating groups compared with the listings with review scores are 96-100.
+
+```{r, warning = FALSE, message = FALSE}
+listings.description.working  %>% 
+  count(rating_group,word) %>% 
+  group_by(rating_group) %>% 
+  mutate(proportion = n/sum(n)) %>% 
+  select(-n) %>% 
+  pivot_wider(names_from = rating_group, values_from = proportion) %>%
+  pivot_longer('1':'5',
+               names_to = "rating", values_to = "proportion")->listings.description.working.freq_plot
+
+ggplot(listings.description.working.freq_plot, aes(x = proportion, y = `6`, 
+                                                   color = abs(`6` - proportion))) +
+  geom_abline(color = "gray40", lty = 2) +
+  geom_jitter(alpha = 0.1, size = 2.5, width = 0.3, height = 0.3) +
+  geom_text(aes(label = word), check_overlap = TRUE, vjust = 1.5) +
+  scale_x_log10(labels = percent_format()) +
+  scale_y_log10(labels = percent_format()) +
+  scale_color_gradient(limits = c(0, 0.001), 
+                       low = "darkslategray4", high = "gray75") +
+  facet_wrap(~rating, ncol = 2) +
+  theme(legend.position="none") +
+  labs(subtitle = "Word Frequency Proportion Against The Highest Scores Group (y-axis)", x = NULL, y = NULL)
+```
+
+- The plot represents the frequency proportion of words with respect to the most frequent words used in the group with rating scores 96-100 (group 6).
+- The diagonal line is the ideal line plotting the words with the same frequency proportion for each group against group 6. 
+- We therefore observe that common words across groups are 'space', 'bed', and 'equipped'.
+- For group 4 (rating scores 86-90), words that deviates the group against group 6 are 'touched', 'count', 'featuring', and 'connect'
+- In addition,'recommendations', 'coffee', and 'experience' are distinctive words for group 5 (rating scores 91-95).
+
+#### Bi-grams
+
+-   Let's tokenizing data using bigrams.
+
+```{r}
+listings.description.working.bigrams <- listings.description %>% 
+  unnest_tokens(bigram, description, token="ngrams",n=2) %>% 
+  separate(bigram, c("word1","word2"), sep = " ") %>% 
+  filter(!word1 %in% stop_words$word) %>% 
+  filter(!word1 %in% custom_stopwords$word) %>% 
+  filter(!word2 %in% stop_words$word) %>% 
+  filter(!word2 %in% custom_stopwords$word) %>% 
+  unite(bigram, word1, word2, sep = " ")
+```
+
+-   Explore the most common bigrams rating wise. 
+
+```{r}
+# top 20 words across all descriptions
+listings.description.working.bigrams %>% 
+  count(bigram) %>% 
+  mutate(bigram=reorder(bigram,n)) %>% 
+  slice_max(n,n=20) %>% 
+  ggplot(aes(bigram,n)) + 
+  geom_bar(stat = "identity") +
+  xlab(NULL) +
+  coord_flip()
+```
+
+-   Recall that the unigram analysis above provides the sense of space, bed, and equipped.
+-   Here, with bigrams, it provides more understanding and details where hosts use the words 'double bed' and 'double bedroom' compared to 'bed' in the unigram analysis. 
+-   It is interesting that 'guest access' becomes the most frequent word hosts use, which is potentially important to attract guests. 
+- In addition, we see the words indicating location and amenities such as 'minutes walk'; 'walking distance'; 'equipped kitchen'; 'washing machine'. This potentially signifies the relationship of the number of amenities, location, room type, to the price or rating scores, which we will investigate more in the last section of part A.
+
+-   Let's explore common words by rating groups.
+
+```{r}
+# most common words used when rating group = 1
+rating4.maxbigram <- listings.description.working.bigrams %>% 
+  filter(rating_group==1) %>%
+  count(bigram) %>% 
+  mutate(bigram=reorder(bigram,n)) %>% 
+  slice_head(n=10) %>% 
+  ggplot(aes(bigram,n)) + 
+  geom_bar(stat = "identity") +
+  xlab(NULL) +
+  labs(title = "Review Score: 0-75") +
+  coord_flip()
+
+# most common words used when rating group = 2
+rating6.maxbigram <- listings.description.working.bigrams %>% 
+  filter(rating_group==2) %>%
+  count(bigram) %>% 
+  mutate(bigram=reorder(bigram,n)) %>% 
+  slice_head(n=10) %>% 
+  ggplot(aes(bigram,n)) + 
+  geom_bar(stat = "identity") +
+  xlab(NULL) +
+  labs(title = "Review Score: 76-80")+
+  coord_flip()
+
+# most common words used when rating group = 3
+rating7.maxbigram <- listings.description.working.bigrams %>% 
+  filter(rating_group==3) %>%
+  count(bigram) %>% 
+  mutate(bigram=reorder(bigram,n)) %>% 
+  slice_head(n=10) %>% 
+  ggplot(aes(bigram,n)) + 
+  geom_bar(stat = "identity") +
+  xlab(NULL) +
+  labs(title = "Review Score: 81-85") +
+  coord_flip()
+
+# most common words used when rating group = 4
+rating8.maxbigram <- listings.description.working.bigrams %>% 
+  filter(rating_group==4) %>%
+  count(bigram) %>% 
+  mutate(bigram=reorder(bigram,n)) %>% 
+  slice_max(n,n=10) %>% 
+  ggplot(aes(bigram,n)) + 
+  geom_bar(stat = "identity") +
+  xlab(NULL) +
+  labs(title = "Review Score: 86-90") +
+  coord_flip()
+
+# most common words used when rating group = 5
+rating9.maxbigram <- listings.description.working.bigrams %>% 
+  filter(rating_group==5) %>%
+  count(bigram) %>% 
+  mutate(bigram=reorder(bigram,n)) %>% 
+  slice_max(n,n=10) %>% 
+  ggplot(aes(bigram,n)) + 
+  geom_bar(stat = "identity") +
+  xlab(NULL) +
+  labs(title = "Review Score: 91-95")+
+  coord_flip()
+
+# most common words used when rating group = 6
+rating10.maxbigram <- listings.description.working.bigrams %>% 
+  filter(rating_group==6) %>%
+  count(bigram) %>% 
+  mutate(bigram=reorder(bigram,n)) %>% 
+  slice_max(n,n=10) %>% 
+  ggplot(aes(bigram,n)) + 
+  geom_bar(stat = "identity") +
+  xlab(NULL) +
+  labs(title = "Review Score: 96-100")+
+  coord_flip()
+
+maxbigram.plots = arrangeGrob(rating4.maxbigram,rating6.maxbigram, rating7.maxbigram, rating8.maxbigram, rating9.maxbigram, rating10.maxbigram) 
+grid.arrange(maxbigram.plots,  ncol = 2, widths = c(3/4,1/4))
+```
+
+- From the plot, common words are about bedrooms or bed types e.g., 'double bed', '1 bedroom'. It is noticed that among the groups with lower rating scores, group 1-3, amenity-related words are missing compared with the other groups.
+- We also observe that the words that deviate the group with rating scores 96-100 from others are about location - 'minute walk' and 'walking distance'; and room - 'king size'.
+
+#### Tri-grams
+
+-   Let's tokenizing by trigrams.
+
+```{r}
+listings.description.working.trigrams <- listings.description %>% 
+  unnest_tokens(trigram, description, token="ngrams",n=3) %>% 
+  separate(trigram, c("word1","word2","word3"), sep = " ") %>% 
+  filter(!word1 %in% stop_words$word) %>% 
+  filter(!word1 %in% custom_stopwords$word) %>% 
+  filter(!word2 %in% stop_words$word) %>%
+  filter(!word2 %in% custom_stopwords$word) %>% 
+  filter(!word3 %in% stop_words$word) %>%
+  filter(!word3 %in% custom_stopwords$word) %>% 
+  unite(trigram, word1, word2,word3, sep = " ")
+
+# top 20 words across all descriptions
+listings.description.working.trigrams %>% 
+  count(trigram) %>% 
+  mutate(trigram=reorder(trigram,n)) %>% 
+  slice_max(n,n=20) %>% 
+  ggplot(aes(trigram,n)) + 
+  geom_bar(stat = "identity") +
+  xlab(NULL) +
+  coord_flip()
+```
+
+-   Trigrams supplies more details, especially words that are related to amenities such as '42 free view', 'free view channels', including words related to bedrooms e.g., 'king size bed', 'en suite shower'
+
+-   Let's explore the most common trigrams rating wise.
+
+```{r}
+# most common words used when rating group = 1
+rating4.maxtrigram <- listings.description.working.trigrams %>% 
+  filter(rating_group==1) %>%
+  count(trigram) %>% 
+  mutate(trigram=reorder(trigram,n)) %>% 
+  slice_head(n=10) %>% 
+  ggplot(aes(trigram,n)) + 
+  geom_bar(stat = "identity") +
+  xlab(NULL) +
+  labs(subtitle = "Review Score: 0-75")+
+  coord_flip()
+
+# most common words used when rating group = 2
+rating6.maxtrigram <- listings.description.working.trigrams %>% 
+  filter(rating_group==2) %>%
+  count(trigram) %>% 
+  mutate(trigram=reorder(trigram,n)) %>% 
+  slice_head(n=10) %>% 
+  ggplot(aes(trigram,n)) + 
+  geom_bar(stat = "identity") +
+  xlab(NULL) +
+  labs(subtitle = "Review Score: 76-80")+
+  coord_flip()
+
+# most common words used when rating group = 3
+rating7.maxtrigram <- listings.description.working.trigrams %>% 
+  filter(rating_group==3) %>%
+  count(trigram) %>% 
+  mutate(trigram=reorder(trigram,n)) %>% 
+  slice_head(n=10) %>% 
+  ggplot(aes(trigram,n)) + 
+  geom_bar(stat = "identity") +
+  xlab(NULL) +
+  labs(subtitle = "Review Score: 81-85")+
+  coord_flip()
+
+# most common words used when rating group = 4
+rating8.maxtrigram <- listings.description.working.trigrams %>% 
+  filter(rating_group==4) %>%
+  count(trigram) %>% 
+  mutate(trigram=reorder(trigram,n)) %>% 
+  slice_max(n,n=10) %>% 
+  ggplot(aes(trigram,n)) + 
+  geom_bar(stat = "identity") +
+  xlab(NULL) +
+  labs(subtitle = "Review Score: 86-90")+
+  coord_flip()
+
+# most common words used when rating group = 5
+rating9.maxtrigram <- listings.description.working.trigrams %>% 
+  filter(rating_group==5) %>%
+  count(trigram) %>% 
+  mutate(trigram=reorder(trigram,n)) %>% 
+  slice_max(n,n=10) %>% 
+  ggplot(aes(trigram,n)) + 
+  geom_bar(stat = "identity") +
+  xlab(NULL) +
+  labs(subtitle = "Review Score: 91-95")+
+  coord_flip()
+
+# most common words used when rating group = 6
+rating10.maxtrigram <- listings.description.working.trigrams %>% 
+  filter(rating_group==6) %>%
+  count(trigram) %>% 
+  mutate(trigram=reorder(trigram,n)) %>% 
+  slice_max(n,n=10) %>% 
+  ggplot(aes(trigram,n)) + 
+  geom_bar(stat = "identity") +
+  xlab(NULL) +
+  labs(subtitle = "Review Score: 96-100")+
+  coord_flip()
+
+maxtrigram.plots = arrangeGrob(rating4.maxtrigram,rating6.maxtrigram, rating7.maxtrigram, rating8.maxtrigram, rating9.maxtrigram, rating10.maxtrigram) 
+grid.arrange(maxtrigram.plots,  ncol = 2, widths = c(3/4,1/4))
+```
+
+-   From the plot, descriptions used by the first group with rating scores 0-75 are missing amentiy-related words. This is possibly the reason why this group has such lower rating scores.
+
+-   Let's further analyze the result by using a network visualization of bigrams and trigrams.
+
+```{r}
+# bigrams graph
+bigram_graph <-  listings.description.working.bigrams %>% separate(bigram, c("word1","word2"), sep=" ") %>% 
+  select(word1,word2) %>% count(word1,word2,sort = TRUE) %>% filter(n>20) %>% graph_from_data_frame()
+
+set.seed(2107)
+
+ggraph(bigram_graph, layout="fr")+
+  geom_edge_link(aes(edge_alpha = n), show.legend = FALSE,
+                 arrow = grid::arrow(type = "closed", length = unit(.10, "inches")), end_cap= circle(0.07, 'inches')) +
+  geom_node_point(colour = "lightblue", size=5)+
+  geom_node_text(aes(label=name), vjust = 1, hjust = 1) +
+  theme_void()
+```
+
+- From the bigrams network above, it provides potential topics such as bedrooms, amentities, transportation, and distance.
+
+```{r}
+# trigrams graph
+trigram_graph <-  listings.description.working.trigrams %>% separate(trigram, c("word1","word2","word3"), sep=" ") %>% 
+  select(word1,word2,word3) %>% count(word1,word2,word3,sort = TRUE) %>% filter(n>10) %>% graph_from_data_frame()
+
+ggraph(trigram_graph, layout="fr")+
+  geom_edge_link(aes(edge_alpha = n), show.legend = FALSE,
+                 arrow = grid::arrow(type = "closed", length = unit(.10, "inches")), end_cap= circle(0.07, 'inches')) +
+  geom_node_point(colour = "lightblue", size=5)+
+  geom_node_text(aes(label=name), vjust = 1, hjust = 1) +
+  theme_void()
+```
+
+- From trigrams network, it provides fewer potential topics such as bedrooms but more details on amenities e.g., '42-free-view-channel', 'freezer-fridge-hob-oven'.
+
+```{r, warning = FALSE, message = FALSE}
+# remove files that are no longer used
+remove(hostname)
+remove(hostname_vector)
+remove(langmodel)
+remove(lematized)
+remove(listing_tf_idf)
+remove(listing_tf_idf_2)
+remove(listing_words)
+remove(maxbigram.plots)
+remove(maxtrigram.plots)
+remove(maxwords.plots)
+remove(listings.description)
+remove(listings.description.byrating)
+remove(listings.description.working)
+remove(listings.description.working.bigrams)
+remove(listings.description.working.trigrams)
+remove(listings.description.working.freq_plot)
+remove(postagged)
+remove(rating10.maxbigram)
+remove(rating10.maxtrigram)
+remove(rating10.maxwords)
+remove(token_df_all)
+remove(token_df2)     
+```
+
+### Related variables to review rating score
+
+-   What variables can be extracted from the text that can be related with the rating score?
+
+#### Formality
+
+-   Firstly, we try to calculate the formality from original comments.
+
+```{r, eval=FALSE}
+df2 = readRDS("df2.rds")
+formality <- qdap::formality(df2$comments_ori,df2$unique_id)
+formality$formality %>% select(unique_id,formality) -> formality_calc
+formality_calc$unique_id <- as.numeric(formality_calc$unique_id)
+
+df2 %>% left_join(formality_calc, by = "unique_id") -> df2_rev_formality
+
+# back up the data and save into .rds file
+saveRDS(df2_rev_formality, file = "df2_rev_formality.rds")
+```
+
+#### Readability
+
+-   After calculating the formality, we can also extract the readability from the comments
+
+```{r, eval=FALSE}
+# read data
+df2_rev_formality = readRDS("df2_rev_formality.rds")
+
+# create an empty dataframe
+readability_all <- data.frame()
+
+# calculate readability score
+for(i in 1:nrow(df2_rev_formality)){
+  
+  readability_h <- data.frame() 
+  
+  this_text <- iconv(df2_rev_formality$comments_ori[i])
+  this_text <- removeNumbers(this_text)
+  this_text <- removePunctuation(this_text)
+  
+  tryCatch(readability_h <- flesch_kincaid(this_text),error=function(e){
+    cat("Error parsing")
+  })
+  
+  if(!is.null(readability_h$Readability)){
+    
+    readability_h <- readability_h$Readability
+    readability_h$unique_id <- df2_rev_formality$unique_id[i]
+    readability_all <- bind_rows(readability_all,readability_h) 
+  }
+  
+  print(i)
+}
+
+# join data
+df2_rev_formality_readability <- df2_rev_formality %>% 
+  left_join(readability_all, by = "unique_id")
+
+# back up the file
+saveRDS(df2_rev_formality_readability, file = "df2_rev_formality_readability.rds")
+```
+
+#### Correlation
+
+-   Let's check correlation of numeric variables
+
+```{r}
+# read data
+df2_rev_formality_readability = readRDS("df2_rev_formality_readability.rds")
+
+# filter only numerical features
+df2_rev_formality_readability %>% select_if(is.numeric) -> df_numeric
+correlate(df_numeric) -> cordata
+
+# explore variables which have higher correlation value than |0.1|
+cordata %>% select(term, review_scores_rating) %>% filter(review_scores_rating > 0.1 | review_scores_rating < -0.1) %>% arrange(desc(review_scores_rating)) 
+```
+
+- Fore more information about how reviews work, please visit https://www.airbnb.co.uk/help/article/1257/star-ratings.
+- From the correlation table above, we see that those features with highly and positively correlated to rating scores are sub-topics such as cleanliness, value, communication. The scores are also relevant to the number of amenities as we suspected above, monthly review numbers, operation years of a business.
+- The interesting feature with highly negative correlation value is the number of listings, which possibly indicates poor management due to multiple listings that hosts need to deal with.
+
+-   Let's split the data into 2 data sets - numerical and categorical data sets.
+-   We presumably select variables that are likely to be relevant to rating scores based on correlation values.
+
+```{r}
+# non-numerical data set
+df_etc = df2_rev_formality_readability %>% select_if(negate(is.numeric)) %>% select(host_is_superhost:host_identity_verified, room_type,instant_bookable,response_time,neighbourhood) 
+
+# numerical data set
+df_numeric = df_numeric %>% select(number_of_reviews, reviews_per_month:review_scores_value,amen_items,ops_year,acceptance_rate,host_total_listings_count, formality, FK_grd.lvl, FK_read.ease, price_adj)
+```
+
+#### Pre-processing data
+
+-   Now, let's do data normalization to use in a regression model
+
+```{r}
+preproc2 <- preProcess(df_numeric, method=c("range"))
+norm2 <- predict(preproc2, df_numeric)
+```
+
+-   Let's combine the data.
+
+```{r}
+df_reg = cbind(norm2, df_etc)
+```
+
+-   We have three main variables extracted from comments - formality, reading grade level, reading-ease. Let's try to see the relationships to reviews score rating, starting with formality.
+
+```{r, warning = FALSE, message = FALSE}
+# formality
+df_reg %>% select(formality,review_scores_rating) %>% na.omit() %>% ggplot(aes(x=formality,y= review_scores_rating))+geom_smooth(method="loess",se = F)+geom_point() + labs(x="Formality", y="Rating scores", subtitle="Rating Scores and Formality Relationship")
+```
+
+-   From the result above, there is no clear relationship, which is possibly due to outliers.
+
+-   Let's remove outliers using IQR technique.
+
+```{r, warning = FALSE, message = FALSE}
+# explore the distribution
+hist(df_reg$formality)
+hist(df_reg$review_scores_rating)
+
+# identifying outliers using IQR
+outliers2 <- boxplot(df_reg$formality, ylab = "Formality")$out
+
+# drop the rows containing outliers
+df_reg <- df_reg[!df_reg$formality %in% outliers2,]
+
+# identifying outliers using IQR
+outliers3 <- boxplot(df_reg$review_scores_rating, ylab = "Review Rating")$out
+
+# drop the rows containing outliers
+df_reg <- df_reg[!df_reg$review_scores_rating %in% outliers3,]
+
+# check the distribution using histogram 
+hist(df_reg$formality)
+hist(df_reg$review_scores_rating)
+
+# inspect the relationship
+df_reg %>% select(formality,review_scores_rating) %>% na.omit() %>% ggplot(aes(x=formality,y= review_scores_rating))+geom_smooth(method="loess",se = F)+geom_point()+ labs(x="Formality", y="Rating scores", subtitle="Rating Scores and Formality Relationship")
+```
+
+-   From the plot, there is still no clear relationship between the two features.
+-   Now, let's explore reading grade level.
+
+```{r, warning = FALSE, message = FALSE}
+outliers4 <- boxplot(df_reg$FK_grd.lvl, ylab = "FKgrd level")$out
+
+# drop the rows containing outliers
+df_reg <- df_reg[!df_reg$FK_grd.lvl %in% outliers4,]
+
+# find the minimum of FK_grd.lvl
+df_reg$FK_grd.lvl %>% summary(.)
+
+# plot reading grade level against review rating scores
+df_reg %>% select(FK_grd.lvl, review_scores_rating) %>% na.omit() %>% ggplot(aes(x=FK_grd.lvl,y= review_scores_rating))+geom_smooth(method="loess",se = F)+geom_point() + labs(x="Reading grade level", y="Rating scores", subtitle="Rating Scores and Reading Grade Level Relationship")
+```
+
+-   From the graph, no noticable relationship is observed between the rating scores and the reading grade level.
+-   Now, let's explore reading ease.
+
+```{r, warning = FALSE, message = FALSE}
+outliers5 <- boxplot(df_reg$FK_read.ease, ylab = "FKrd ease level")$out
+
+# drop the rows containing outliers
+df_reg <- df_reg[!df_reg$FK_read.ease %in% outliers5,]
+
+# find the minimum of FK_grd.lvl
+df_reg$FK_grd.lvl %>% summary(.)
+
+# FK reading ease
+df_reg %>% select(FK_read.ease,review_scores_rating) %>% na.omit() %>% ggplot(aes(x=FK_read.ease,y= review_scores_rating))+geom_smooth(method="loess",se = F)+geom_point() + labs(x="Reading ease", y="Rating scores", subtitle="Rating Scores and Reading Ease Relationship")
+```
+
+-   From the graph, no explicit relationship is observed between the rating scores and the reading ease level.
+
+#### Regression Models
+
+-   <https://www.rdocumentation.org/packages/MASS/versions/7.3-54/topics/stepAIC>
+-   Let's use all variables as predictors to gain idea how they are related to rating scores.
+
+```{r}
+# delete the variable 'profile pic of a host' due to linearity (the proportion of TRUE is more than 95%)
+# change room types to be factor
+df_reg2 <- df_reg %>% mutate(room_type = factor(room_type)) %>% select(-host_has_profile_pic)
+
+# regression
+model1 <- lm(review_scores_rating ~ ., data = df_reg2, na.action=na.exclude)
+
+model1 %>% tidy() %>% kable(
+    caption = "Coefficient Estimation for Rating Scores Prediction",
+    col.names = c("Predictor", "B", "SE", "t", "p"),
+    digits = c(0, 2, 2, 2, 2)
+  )
+```
+
+- Let's use stepwise AIC to find the best predictors
+
+```{r}
+# using stepwise AIC to find the best predictors
+aic_model1 = MASS::stepAIC(model1, direction = "both")
+aic_model1$anova
+```
+
+-   The approach provides the final predictors where 'room types' and 'FK reading ease level' are removed.
+-   Let's see the result from using AIC stepwise approach.
+
+```{r}
+model2 <- lm(review_scores_rating ~ . -FK_read.ease -room_type, data = df_reg2, na.action=na.exclude)
+model2 %>% tidy() %>% kable(
+    caption = "Coefficient Estimation for Rating Scores Prediction",
+    col.names = c("Predictor", "B", "SE", "t", "p"),
+    digits = c(0, 2, 2, 2, 2)
+  )
+
+# check multicollinearity
+imcdiag(model2)
+```
+
+- The VIF scores confirm that there is multicollinearity where the potential causes are from the number of reviews.
+- Hence, we will remove the variable including a number of listings where it is highly correlated with multiple variables such as review_scores_value and review_scores_rating.
+
+```{r}
+model3 <- lm(review_scores_rating ~ . -FK_read.ease -room_type -number_of_reviews -host_total_listings_count, data = df_reg2, na.action=na.exclude)
+
+# summary
+model3 %>% tidy() %>% kable(
+    caption = "Coefficient Estimation for Rating Scores Prediction",
+    col.names = c("Predictor", "B", "SE", "t", "p"),
+    digits = c(0, 2, 2, 2, 2)
+  )
+
+# check multicollinearity
+imcdiag(model3)
+```
+
+-   From the result, the predictors are able to explain the rating scores with adjusted R-squared, 0.7. 
+-   With 95% confidence, we observe that higher rating scores are positively related to check-in simplicity (p < 0.05), information accuracy (p < 0.05), cleanliness, and the number of amentities (p < 0.05), respectively (p < 0.05).
+-   The text formality negatively impacts on rating scores (though it is not significant) in line with the positive impact observed from FK grading level (p < 0.05).
+-   Room types don't significantly impact the scores, we hence further explore it to confirm the result.
+
+```{r, warning = FALSE, message = FALSE}
+df_reg2 %>% ggplot(aes(x=room_type, y=review_scores_rating)) + geom_boxplot() + labs(x="Room types", y="Rating scores", subtitle="Rating Scores by Room Types")
+```
+
+### Owner name importance
+
+-   Is mentioning the name of the owner important?
+
+    -   To answer this question, we need to find host name and the original comments from the original data
+    -   This is because we use the host name s the stop word for other analysis
+    -   Note that there are multiple names in the host_name column, we hence need to tokenize, remove stop word and any symbols such as "&", "and"
+
+```{r, warning = FALSE, message = FALSE}
+# read the backup data
+df <- readRDS("df2_rev_formality_readability.rds")
+df_hostname <- file[[1]] %>% select (listing_id = id,host_name)  %>% na.omit()
+df_hostname$host_name %>% tolower() -> df_hostname$host_name
+df_hostname <- df_hostname %>% unnest_tokens(host_name,host_name)
+df_hostname <- df_hostname %>% filter(length(host_name)>2)
+
+# remove stop words
+data("stop_words")
+df_hostname$host_name <- gsub("[^a-zA-Z\\s]", "",df_hostname$host_name)
+df_hostname <- df_hostname %>% anti_join(stop_words, by = c("host_name"="word"))
+
+# joining data
+df %>% left_join(df_hostname,by = "listing_id") -> df
+```
+
+-   We will check the influence of mentioning the name of the owner to the review rating score
+
+-   Hence, we will do feature engineering by creating a new binary column [0,1] whether a reviewer has mentioned the owner name or not
+
+```{r, warning = FALSE, message = FALSE}
+df$host_name_mentioned <- NA
+
+for(i in 1:nrow(df)){
+  check_h <- as.numeric(grepl(df$host_name[i],
+                              df$comments[i],
+                              ignore.case = T))
+  df$host_name_mentioned[i] <- check_h
+}
+```
+
+-   After we use left join df_hostname, we can find the number of observations increases because we separate the multiple hosts to different rows
+
+-   Now, we will detect the unique_id, which has more than one row
+
+```{r, warning = FALSE, message = FALSE}
+df  %>% select(unique_id,host_name_mentioned) %>% group_by(unique_id) %>%summarise( n=n()) %>% filter(n>1) %>% select(unique_id) -> multipleID
+
+# let's filter these reviews and create another data frame, 
+df %>% select(listing_id,unique_id,host_name_mentioned) %>% filter(unique_id %in% c(multipleID$unique_id))  -> duplicated_df
+
+# calculate the total number of mentions for each review
+duplicated_df %>%  group_by(unique_id) %>% mutate(n = sum(host_name_mentioned)) -> duplicated_df
+
+# create a dummy variable where 1 equals the number of mentions is equal to 1 or more
+duplicated_df$host_name_mentioned <- ifelse(duplicated_df$n>0,1,0)
+
+# for the duplicate ids, we impute the same value across those ids
+df[which(df$unique_id %in% c(duplicated_df$unique_id)),]$host_name_mentioned <- duplicated_df$host_name_mentioned
+
+# let's delete the duplicated rows to get the similar number of rows that is definitely the same before we did left join the 'df_hostname' data set
+df %>% distinct(unique_id,.keep_all =TRUE) -> df
+df  %>% select(listing_id,unique_id,host_name_mentioned)
+
+# let's create a box plot
+ggplot(subset(df,!is.na(host_name_mentioned)),aes(x=factor(host_name_mentioned),y=review_scores_rating))+geom_boxplot() + labs(x="Host name mentioned", y="Rating scores", subtitle="Rating Scores by Host Name Groups")
+
+# let's test whether there is difference when a reviewer mentions host name or not
+t.test(df$review_scores_rating~factor(df$host_name_mentioned))
+```
+
+- We can see from the t-test that the estimation of rating scores among those reviews mentioning host names is higher than those without host names mention (p < 0.0001, t = -39.162)
+
+### Price and description relationship
+
+-   Using the textual description of the property supplied by the owner, how does this relate with the price that the property is listed for rent?
+
+-   To analyze the textual description, we use formality and readability extracted from the description. First we read 'df' data and only keep one row for each listing since a listing has only one description
+
+#### Formality
+
+```{r, eval=FALSE, warning = FALSE, message = FALSE}
+# read data
+df2 = readRDS("df2.rds")
+
+# for this question we need the average rating score to compare each listing
+df_listing <- df2  %>% distinct(listing_id,.keep_all = TRUE)
+
+# calculate the formality
+formality_des <- qdap::formality(df_listing$description_ori,df_listing$listing_id)
+formality_des$formality %>% select(listing_id,formality) -> formality_calc_des
+formality_calc_des$listing_id <- as.numeric(formality_calc_des$listing_id)
+
+# left join
+df_listing %>% left_join(formality_calc_des, by = "listing_id") -> df_listing
+```
+
+#### Readability
+
+```{r, eval=FALSE, warning = FALSE, message = FALSE}
+# calculate the readability
+readability_desc_all <- data.frame()
+
+library(qdap)
+library(tm)
+for(i in 1:nrow(df_listing)){
+  
+  readability_h <- data.frame() 
+  
+  this_text <- iconv(df_listing$description[i])
+  this_text <- removeNumbers(this_text)
+  this_text <- removePunctuation(this_text)
+  
+  tryCatch(readability_h <- flesch_kincaid(this_text),error=function(e){
+    cat("Error parsing")
+  })
+  
+  if(!is.null(readability_h$Readability)){
+    
+    readability_h <- readability_h$Readability
+    readability_h$listing_id <- df_listing$listing_id[i]
+    readability_desc_all <- bind_rows(readability_desc_all,readability_h) 
+  }
+  
+  print(i)
+}
+
+# save the result to our data frame
+df_listing <- df_listing %>% 
+  left_join(readability_desc_all, by = "listing_id")
+
+# save the result
+saveRDS(df_listing, file = "df_desc_formality_read.rds")
+# df_listing <- readRDS("df_desc_formality_read.rds")
+
+```
+
+-   We have additional variables extracted from the textual description. 
+-   We cannot impute NA values so we filter them out. 
+-   Let's split the data into 2 data sets - numerical and categorical sets.
+
+```{r, warning = FALSE, message = FALSE}
+# read data
+df_listing = readRDS("df_desc_formality_read.rds")
+
+# non-numerical data set
+df_etc_des = df_listing %>% select_if(negate(is.numeric)) %>% select(host_is_superhost:host_identity_verified, room_type,instant_bookable,response_time,neighbourhood) 
+
+# numerical data set
+df_numeric_des = df_listing %>% select(number_of_reviews, reviews_per_month:review_scores_value,amen_items,ops_year,acceptance_rate,host_total_listings_count, formality, word.count, syllable.count, FK_grd.lvl, FK_read.ease, price_adj)
+```
+
+#### Correlation
+
+-   Let's check correlation of numeric variables.
+
+```{r, warning = FALSE, message = FALSE}
+# create a correlation matrix
+correlate(df_numeric_des) -> cordata_3
+
+cordata_3 %>% select(term, price_adj) %>% filter(price_adj > 0.1 | price_adj < -0.1) %>% arrange(desc(price_adj))
+```
+
+- We can see positive relationship with adjusted price from the number of listings while negative relationship is observed from the number of reviews and value rating scores.
+
+#### Pre-processing data
+
+-   Now, let's do data normalization to use in a regression model.
+
+```{r}
+preproc3 <- preProcess(df_numeric_des, method=c("range"))
+norm3 <- predict(preproc3, df_numeric_des)
+```
+
+-   Let's combine the data
+
+```{r}
+df_reg_des = cbind(norm3, df_etc_des)
+```
+
+-   Let's explore formality
+
+```{r}
+# formality
+df_reg_des %>% select(formality,price_adj) %>% na.omit() %>% ggplot(aes(x=formality,y= price_adj))+geom_smooth(method="loess",se = F)+geom_point() + labs(x="Formality", y="Price", subtitle="Price and Formality Relationship")
+```
+
+-   From the result above, it seems there is no clear relationship, which is possibly due to outliers.
+
+-   Let's remove outliers using IQR technique.
+
+```{r}
+# explore the distribution
+hist(df_reg_des$formality)
+hist(df_reg_des$price_adj)
+
+# identifying outliers using IQR
+outliers6 <- boxplot(df_reg_des$price_adj, ylab = "Price")$out
+
+# drop the rows containing outliers
+df_reg_des <- df_reg_des[!df_reg_des$price_adj %in% outliers6,]
+
+hist(df_reg_des$formality)
+hist(df_reg_des$price_adj)
+
+df_reg_des %>% select(formality,price_adj) %>% na.omit() %>% ggplot(aes(x=formality,y= price_adj))+geom_smooth(method="loess",se = F)+geom_point() + labs(x="Formality", y="Price", subtitle="Price and Formality Relationship")
+```
+
+-   Now, let's explore reading grade level
+
+```{r}
+outliers7 <- boxplot(df_reg_des$FK_grd.lvl, ylab = "FKgrd level")$out
+
+# drop the rows containing outliers
+df_reg_des <- df_reg_des[!df_reg_des$FK_grd.lvl %in% outliers7,]
+
+# find the minimum of FK_grd.lvl
+df_reg_des$FK_grd.lvl %>% summary(.)
+
+# FK grd level
+df_reg_des %>% select(FK_grd.lvl, price_adj) %>% na.omit() %>% ggplot(aes(x=FK_grd.lvl,y= price_adj))+geom_smooth(method="loess",se = F)+geom_point() + labs(x="Reading grade level", y="Price", subtitle="Price and Reading Grade Level Relationship")
+```
+
+-   There is no clear relationship between price and reading grade level.
+-   Now, let's explore reading ease.
+
+```{r}
+outliers8 <- boxplot(df_reg_des$FK_read.ease, ylab = "FKrd ease level")$out
+
+# drop the rows containing outliers
+df_reg_des <- df_reg_des[!df_reg_des$FK_read.ease %in% outliers8,]
+
+# find the minimum of FK_grd.lvl
+df_reg_des$FK_grd.lvl %>% summary(.)
+
+# FK reading ease level
+df_reg_des %>% select(FK_read.ease,price_adj) %>% na.omit() %>% ggplot(aes(x=FK_read.ease,y= price_adj))+geom_smooth(method="loess",se = F)+geom_point() + labs(x="Reading ease level", y="Price", subtitle="Price and Reading Ease Level Relationship")
+```
+
+- The plot above shows no sign of relationship between price and reading ease level.
+
+#### Regression Models
+
+-  Let's analyze and predict price by using regression model.
+
+```{r}
+# update room types to be factor and remove 'host_has_profile_pic' due to linearity
+df_reg_des2 <- df_reg_des %>% mutate(room_type = factor(room_type)) %>% select(-host_has_profile_pic) 
+
+# remove NULL values
+df_reg_des3 <- df_reg_des2 %>% na.omit()
+```
+
+```{r}
+# regression
+model4 <- lm(price_adj ~ ., data = df_reg_des3, na.action = na.exclude)
+model4 %>% tidy() %>% kable(
+    caption = "Coefficient Estimation for Price Prediction",
+    col.names = c("Predictor", "B", "SE", "t", "p"),
+    digits = c(0, 2, 2, 2, 2)
+  )
+```
+
+```{r}
+# use a stepwise approach to determine predictors
+aic_model4 = MASS::stepAIC(model4, direction = "both")
+aic_model4$anova
+```
+
+-   Using stepwise approach, it provides the final predictors by removing several variables such as 'FK_read.ease', 'review_scores_communication', etc.
+
+-   Let's check the result from the stepwise approach.
+
+```{r}
+model5 <- lm(price_adj ~ reviews_per_month + review_scores_rating + 
+    review_scores_accuracy + review_scores_cleanliness + review_scores_value + 
+    ops_year + acceptance_rate + host_total_listings_count + 
+    formality + room_type + response_time + neighbourhood, data = df_reg_des3, 
+    na.action = na.exclude)
+
+imcdiag(model5)
+```
+
+- The VIF scores confirm that there is multicollinearity where the potential causes are from the overall rating scores.
+- Hence, we will remove the variable.
+
+```{r}
+model6 <- lm(price_adj ~ reviews_per_month + 
+    review_scores_accuracy + review_scores_cleanliness + review_scores_value + 
+    ops_year + acceptance_rate + host_total_listings_count + 
+    formality + room_type + response_time + neighbourhood, data = df_reg_des3, 
+    na.action = na.exclude)
+
+# summary
+model6 %>% tidy() %>% kable(
+    caption = "Coefficient Estimation for Rating Scores Prediction",
+    col.names = c("Predictor", "B", "SE", "t", "p"),
+    digits = c(0, 2, 2, 2, 2)
+  )
+
+# check multicollinearity
+imcdiag(model6)
+```
+
+-   From the result, the predictors are able to explain the rating scores with adjusted R-squared, 0.48. 
+-   With 95% confidence, we observe that higher price per person is positively related to information accuracy (p < 0.05), cleanliness (p < 0.05), and business operation years (p < 0.05).
+-   The number of reviews per month negatively affect price. This is possibly because those listings with high price are not widely affordable.
+-   No sign of significant impact from text formality.
